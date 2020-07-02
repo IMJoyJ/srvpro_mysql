@@ -11,6 +11,7 @@ execFile = require('child_process').execFile
 spawn = require('child_process').spawn
 spawnSync = require('child_process').spawnSync
 _async = require('async')
+zlib = require 'zlib'
 
 # 三方库
 _ = global._ = require 'underscore'
@@ -341,7 +342,7 @@ try
   tips = global.tips = loadJSON('./config/tips.json')
   if !tips.tips_zh
     tips.tips_zh = []
-    setting_save(tips);
+    setting_save(tips)
 catch
   tips = global.tips = default_data.tips
   setting_save(tips)
@@ -354,7 +355,7 @@ try
   dialogues = global.dialogues = loadJSON('./config/dialogues.json')
   if !dialogues.dialogues_custom
     dialogues.dialogues_custom = {}
-    setting_save(dialogues);
+    setting_save(dialogues)
 catch
   dialogues = global.dialogues = default_data.dialogues
   setting_save(dialogues)
@@ -404,19 +405,38 @@ try
 catch
 
 if settings.modules.cloud_replay.enabled
-  redis = require 'redis'
-  zlib = require 'zlib'
-  redisdb = global.redisdb = redis.createClient(settings.modules.cloud_replay.redis)
-  redisdb.on 'error', (err)->
-    log.warn err
-    return
-
+  if settings.modules.cloud_replay.engine == 'redis'
+    redis = require 'redis'
+    redisdb = global.redisdb = redis.createClient(settings.modules.cloud_replay.redis)
+    redisdb.on 'error', (err) ->
+      log.warn err
+      return
+  else if settings.modules.cloud_replay.engine == 'mysql'
+    console.log('loading mysql')
+    mysql = require 'mysql'
+    mysql_sync = require 'sync-mysql'
+    mysqldb = global.mysqldb = mysql.createConnection(settings.modules.cloud_replay.mysql)
+    mysqldb_sync = global.mysqldb_sync = new mysql_sync(settings.modules.cloud_replay.mysql)
+    mysqldb.on 'error', (err) ->
+      log.warn err
+      return
+    #sql = 'CREATE DATABASE ygo;'
+    #mysqldb.query sql, sqlParams, (err, result)->
+    #  if err
+    #    log.info err
+    #  return
+    #sql = 'CREATE TABLE CloudReplay(ip VARCHAR(255), replayId BIGINT(20),
+    # replayBuffer BLOB, playerNames TEXT, saveDate TEXT);'
+    #mysqldb.query sql, sqlParams, (err, result)->
+    #  if err
+    #    log.info err
+    #  return
 if settings.modules.windbot.enabled
   windbots = global.windbots = loadJSON(settings.modules.windbot.botlist).windbots
   real_windbot_server_ip = global.real_windbot_server_ip = settings.modules.windbot.server_ip
   if !settings.modules.windbot.server_ip.includes("127.0.0.1")
     dns = require('dns')
-    dns.lookup(settings.modules.windbot.server_ip,(err,addr) ->
+    dns.lookup(settings.modules.windbot.server_ip, (err,addr) ->
       if(!err)
         real_windbot_server_ip = global.real_windbot_server_ip = addr
     )
@@ -1206,7 +1226,7 @@ class Room
     @established = false
     @watcher_buffers = []
     @recorder_buffers = []
-    @cloud_replay_id = Math.floor(Math.random()*100000000)
+    @cloud_replay_id = Math.floor(Math.random()*90000000+10000000)
     @watchers = []
     @random_type = ''
     @welcome = ''
@@ -1491,26 +1511,38 @@ class Room
         return
       recorder_buffer=Buffer.concat(@recorder_buffers)
       zlib.deflate recorder_buffer, (err, replay_buffer) ->
-        replay_buffer=replay_buffer.toString('binary')
         #log.info err, replay_buffer
         date_time=moment().format('YYYY-MM-DD HH:mm:ss')
         #replay_id=Math.floor(Math.random()*100000000)
-        redisdb.hmset("replay:"+replay_id,
-                      "replay_id", replay_id,
-                      "replay_buffer", replay_buffer,
-                      "player_names", player_names,
-                      "date_time", date_time)
-        if !log_rep_id and !settings.modules.cloud_replay.never_expire
-          redisdb.expire("replay:"+replay_id, 60*60*24)
-        recorded_ip=[]
-        _.each player_ips, (player_ip)->
-          return if _.contains(recorded_ip, player_ip)
-          recorded_ip.push player_ip
-          redisdb.lpush(player_ip+":replays", replay_id)
+        if settings.modules.cloud_replay.engine == 'redis'
+          replay_buffer=replay_buffer.toString('binary')
+          redisdb.hmset("replay:"+replay_id,
+                        "replay_id", replay_id,
+                        "replay_buffer", replay_buffer,
+                        "player_names", player_names,
+                        "date_time", date_time)
+          if !log_rep_id and !settings.modules.cloud_replay.never_expire
+            redisdb.expire("replay:"+replay_id, 60*60*24)
+          recorded_ip=[]
+          _.each player_ips, (player_ip)->
+            return if _.contains(recorded_ip, player_ip)
+            recorded_ip.push player_ip
+            redisdb.lpush(player_ip+":replays", replay_id)
+            return
+          if log_rep_id
+            log.info "error replay: R#" + replay_id
           return
-        if log_rep_id
-          log.info "error replay: R#" + replay_id
-        return
+        else if settings.modules.cloud_replay.engine == 'mysql'
+          recorded_ip=[]
+          _.each player_ips, (player_ip)->
+            return if _.contains(recorded_ip, player_ip)
+            recorded_ip.push player_ip
+            sql = 'INSERT INTO CloudReplay(ip,replayId,replayBuffer,playerNames,saveDate) VALUES(?,?,?,?,?);'
+            sqlParams = [player_ip, replay_id, replay_buffer, player_names, date_time]
+            mysqldb.query sql, sqlParams, (err, result)->
+              if err
+                log.info err
+              return
     @watcher_buffers = []
     @recorder_buffers = []
     @players = []
@@ -1838,15 +1870,22 @@ net.createServer (client) ->
       if err or !replay
         ygopro.stoc_die(client, "${cloud_replay_no}")
         return
-      redisdb.expire("replay:"+replay.replay_id, 60*60*48)
-      buffer=Buffer.from(replay.replay_buffer,'binary')
+      if settings.modules.cloud_replay.engine == 'redis'
+        if !settings.modules.cloud_replay.never_expire
+          redisdb.expire("replay:"+replay.replay_id, 60*60*48)
+        buffer=Buffer.from(replay.replay_buffer,'binary')
+      else if settings.modules.cloud_replay.engine == 'mysql'
+        buffer=Buffer.from(replay[0].replayBuffer)
       zlib.unzip buffer, (err, replay_buffer) ->
         if err
           log.info "cloud replay unzip error: " + err
           ygopro.stoc_send_chat(client, "${cloud_replay_error}", ygopro.constants.COLORS.RED)
           CLIENT_kick(client)
           return
-        ygopro.stoc_send_chat(client, "${cloud_replay_playing} R##{replay.replay_id} #{replay.player_names} #{replay.date_time}", ygopro.constants.COLORS.BABYBLUE)
+        if settings.modules.cloud_replay.engine == 'redis'
+          ygopro.stoc_send_chat(client, "${cloud_replay_playing} R##{replay.replay_id} #{replay.player_names} #{replay.date_time}", ygopro.constants.COLORS.BABYBLUE)
+        if settings.modules.cloud_replay.engine == 'mysql'
+          ygopro.stoc_send_chat(client, "${cloud_replay_playing} R#" + replay[0].replayId + " " + replay[0].playerNames + " " + replay[0].saveDate, ygopro.constants.COLORS.BABYBLUE)
         client.write replay_buffer, ()->
           CLIENT_kick(client)
           return
@@ -2002,17 +2041,23 @@ ygopro.ctos_follow 'JOIN_GAME', true, (buffer, info, client, server, datas)->
     ygopro.stoc_die(client, "${bad_user_name}")
 
   else if info.pass.toUpperCase()=="R" and settings.modules.cloud_replay.enabled
-    ygopro.stoc_send_chat(client,"${cloud_replay_hint}", ygopro.constants.COLORS.BABYBLUE)
-    redisdb.lrange CLIENT_get_authorize_key(client)+":replays", 0, 2, (err, result)->
-      _.each result, (replay_id,id)->
-        redisdb.hgetall "replay:"+replay_id, (err, replay)->
-          if err or !replay
-            log.info "cloud replay getall error: " + err if err
+    if settings.modules.cloud_replay.engine == 'redis'
+      ygopro.stoc_send_chat(client,"${cloud_replay_hint}", ygopro.constants.COLORS.BABYBLUE)
+      redisdb.lrange CLIENT_get_authorize_key(client)+":replays", 0, 2, (err, result)->
+        _.each result, (replay_id,id)->
+          redisdb.hgetall "replay:"+replay_id, (err, replay)->
+            if err or !replay
+              log.info "cloud replay getall error: " + err if err
+              return
             return
-          ygopro.stoc_send_chat(client,"<#{id-0+1}> R##{replay_id} #{replay.player_names} #{replay.date_time}", ygopro.constants.COLORS.BABYBLUE)
           return
-        return
-      return
+    if settings.modules.cloud_replay.engine == 'mysql'
+      sql = "SELECT * FROM CloudReplay WHERE ip='#{client.ip}' ORDER BY saveDate DESC LIMIT 8"
+      mysqldb.query sql,(err,replay)->
+        if err or !replay
+          return
+        for i in [0...replay.length]
+          ygopro.stoc_send_chat(client, "<#{i+1}> R##{replay[i].replayId} #{replay[i].playerNames} #{replay[i].saveDate}", ygopro.constants.COLORS.BABYBLUE)
     # 强行等待异步执行完毕_(:з」∠)_
     setTimeout (()->
       ygopro.stoc_send client, 'ERROR_MSG',{
@@ -2048,22 +2093,39 @@ ygopro.ctos_follow 'JOIN_GAME', true, (buffer, info, client, server, datas)->
   else if info.pass[0...2].toUpperCase()=="R#" and settings.modules.cloud_replay.enabled
     replay_id=info.pass.split("#")[1]
     if (replay_id>0 and replay_id<=9)
-      redisdb.lindex client.ip+":replays", replay_id-1, (err, replay_id)->
-        if err or !replay_id
-          log.info "cloud replay replayid error: " + err if err
-          ygopro.stoc_die(client, "${cloud_replay_no}")
+      if settings.modules.cloud_replay.engine == 'redis'
+        redisdb.lindex client.ip+":replays", replay_id-1, (err, replay_id)->
+          if err or !replay_id
+            log.info "cloud replay replayid error: " + err if err
+            ygopro.stoc_die(client, "${cloud_replay_no}")
+            return
+          redisdb.hgetall "replay:"+replay_id, client.open_cloud_replay
           return
-        redisdb.hgetall "replay:"+replay_id, client.open_cloud_replay
-        return
+      if settings.modules.cloud_replay.engine == 'mysql'
+        sql = 'SELECT * FROM CloudReplay WHERE ip=#{client.ip} ORDER BY saveDate DESC LIMIT 8;'
+        mysqldb.query sql, (err, result)->
+          if err || !result || !result[replay_id - 1]
+            ygopro.stoc_die(client, "${cloud_replay_no}")
+            log.info err
+            return
+          sql = "SELECT * FROM CloudReplay WHERE replayId=#{result[replay_id-1].replayId};"
+          mysqldb.query sql,client.open_cloud_replay
     else if replay_id
-      redisdb.hgetall "replay:"+replay_id, client.open_cloud_replay
+      if settings.modules.cloud_replay.engine == 'redis'
+        redisdb.hgetall "replay:" + replay_id, client.open_cloud_replay
+      if settings.modules.cloud_replay.engine == 'mysql'
+        sql = "SELECT * FROM CloudReplay WHERE replayId=#{replay_id};"
+        mysqldb.query(sql, client.open_cloud_replay)
     else
       ygopro.stoc_die(client, "${cloud_replay_no}")
 
   else if info.pass.toUpperCase()=="W" and settings.modules.cloud_replay.enabled
-    replay_id=Cloud_replay_ids[Math.floor(Math.random()*Cloud_replay_ids.length)]
-    redisdb.hgetall "replay:"+replay_id, client.open_cloud_replay
-
+    if settings.modules.cloud_replay.engine == 'redis'
+      replay_id = Cloud_replay_ids[Math.floor(Math.random() * Cloud_replay_ids.length)]
+      redisdb.hgetall "replay:" + replay_id, client.open_cloud_replay
+    if settings.modules.cloud_replay.engine == 'mysql'
+      sql = "SELECT * FROM CloudReplay AS t1 JOIN (SELECT ROUND(RAND() * ((SELECT MAX(replayId) FROM CloudReplay)-(SELECT MIN(replayId) FROM CloudReplay))+(SELECT MIN(replayId) FROM CloudReplay)) AS replayId) AS t2 WHERE t1.replayId >= t2.replayId ORDER BY t1.replayId LIMIT 1;"
+      mysqldb.query sql, client.open_cloud_replay
   else if info.version != settings.version # and (info.version < 9020 or settings.version != 4927) #强行兼容23333版
     ygopro.stoc_send_chat(client, settings.modules.update, ygopro.constants.COLORS.RED)
     ygopro.stoc_send client, 'ERROR_MSG', {
@@ -4038,7 +4100,7 @@ if settings.modules.http
         response.writeHead(200)
         response.end(addCallback(u.query.callback, '{"rooms":[{"roomid":"0","roomname":"密码错误","needpass":"true"}]}'))
       else
-        roomsjson = [];
+        roomsjson = []
         _async.each(ROOM_all, (room, done)->
           if !(room and room.established)
             done()

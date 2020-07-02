@@ -23,14 +23,17 @@
     "load-json-file": "latest",
     "lzma": "^2.3.2",
     "moment": "latest",
+    "mysql": "^2.18.1",
     "pg": "^6.4.2",
     "querystring": "^0.2.0",
     "redis": "latest",
     "request": "latest",
     "sqlite3": "latest",
+    "sync-mysql": "^3.0.1",
     "underscore": "latest",
     "underscore.string": "latest",
-    "ws": "^1.1.1"
+    "ws": "^1.1.1",
+    "zlib": "^1.0.5"
   },
   "license": "AGPL-3.0",
   "scripts": {
